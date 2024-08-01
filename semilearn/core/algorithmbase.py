@@ -11,12 +11,12 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, precision_s
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
-
+import torch.autograd.profiler as profiler
 from semilearn.core.hooks import Hook, get_priority, CheckpointHook, TimerHook, LoggingHook, DistSamplerSeedHook, ParamUpdateHook, EvaluationHook, EMAHook, WANDBHook, AimHook
 from semilearn.core.utils import get_dataset, get_data_loader, get_optimizer, get_cosine_schedule_with_warmup, Bn_Controller
 from semilearn.core.criterions import CELoss, ConsistencyLoss
-
-
+from PIL import Image
+import time
 class AlgorithmBase:
     """
         Base class for algorithms
@@ -43,6 +43,7 @@ class AlgorithmBase:
         # common arguments
         self.args = args
         self.num_classes = args.num_classes
+        self.num_labels = args.num_labels
         self.ema_m = args.ema_m
         self.epochs = args.epoch
         self.num_train_iter = args.num_train_iter
@@ -55,10 +56,11 @@ class AlgorithmBase:
         self.clip_grad = args.clip_grad
         self.save_name = args.save_name
         self.save_dir = args.save_dir
+        self.load_path = args.load_path
         self.resume = args.resume
         self.algorithm = args.algorithm
-
-        # common utils arguments
+        self.dataset = args.dataset
+        # commaon utils arguments
         self.tb_log = tb_log
         self.print_fn = print if logger is None else logger.info
         self.ngpus_per_node = torch.cuda.device_count()
@@ -101,7 +103,9 @@ class AlgorithmBase:
         self._hooks = []  # record underlying hooks 
         self.hooks_dict = OrderedDict() # actual object to be used to call hooks
         self.set_hooks()
-
+        
+        self.switch = "on"
+        
     def init(self, **kwargs):
         """
         algorithm specific init function, to add parameters into class
@@ -288,7 +292,9 @@ class AlgorithmBase:
         """
         self.model.train()
         self.call_hook("before_run")
-
+        # self.load_model(self.load_path)
+        threshold_tape = np.zeros(self.epochs)
+        psudeo_acc_tape = np.zeros(self.epochs)
         for epoch in range(self.start_epoch, self.epochs):
             self.epoch = epoch
             
@@ -296,21 +302,19 @@ class AlgorithmBase:
             if self.it >= self.num_train_iter:
                 break
             
-            self.call_hook("before_train_epoch")
-
+            self.total_time = 0
             for data_lb, data_ulb in zip(self.loader_dict['train_lb'],
                                          self.loader_dict['train_ulb']):
                 # prevent the training iterations exceed args.num_train_iter
                 if self.it >= self.num_train_iter:
                     break
-
+                
                 self.call_hook("before_train_step")
                 self.out_dict, self.log_dict = self.train_step(**self.process_batch(**data_lb, **data_ulb))
                 self.call_hook("after_train_step")
                 self.it += 1
             
             self.call_hook("after_train_epoch")
-
         self.call_hook("after_run")
 
 
@@ -368,7 +372,6 @@ class AlgorithmBase:
         if return_logits:
             eval_dict[eval_dest+'/logits'] = y_logits
         return eval_dict
-
 
     def get_save_dict(self):
         """
@@ -479,7 +482,7 @@ class AlgorithmBase:
             fn_name (str): The function name in each hook to be called, such as
                 "before_train_epoch".
             hook_name (str): The specific hook name to be called, such as
-                "param_update" or "dist_align", used to call single hook in train_step.
+                "param_update" or "dist_align", uesed to call single hook in train_step.
         """
         
         if hook_name is not None:
@@ -499,7 +502,7 @@ class AlgorithmBase:
     @staticmethod
     def get_argument():
         """
-        Get specified arguments into argparse for each algorithm
+        Get specificed arguments into argparse for each algorithm
         """
         return {}
 
@@ -516,7 +519,7 @@ class ImbAlgorithmBase(AlgorithmBase):
     
     def imb_init(self, *args, **kwargs):
         """
-        initialize imbalanced algorithm parameters
+        intiialize imbalanced algorithm parameters
         """
         pass 
 

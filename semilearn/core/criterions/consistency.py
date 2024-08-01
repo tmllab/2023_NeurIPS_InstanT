@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn 
 from torch.nn import functional as F
 
-from .cross_entropy import ce_loss
+from .cross_entropy import ce_loss, forward_loss
 
 
 

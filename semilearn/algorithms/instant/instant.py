@@ -4,48 +4,43 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .utils import AdaMatchThresholdingHook, InstantThresholdingHook
+import numpy as np
+from .utils import InstantThresholdingHook, forward_loss, class_forward_loss, scale_t, error, gt_InstantThresholdingHook
 from semilearn.core import AlgorithmBase
 from semilearn.core.utils import ALGORITHMS
-from semilearn.algorithms.hooks import PseudoLabelingHook, DistAlignEMAHook
+from semilearn.algorithms.hooks import PseudoLabelingHook, DistAlignEMAHook, FixedThresholdingHook
 from semilearn.algorithms.utils import SSL_Argument, str2bool
-from .T_estimator import ResNet18_F, ResNet34, ResNet50
+from .T_estimator import ResNet18_F, ResNet18_N, ResNet34, ResNet50, ResNet18
+import time
+import datetime
 
+def replace_inf_to_zero(val):
+    val[val == float('inf')] = 0.0
+    return val
 
-@ALGORITHMS.register('adamatch')
-class AdaMatch(AlgorithmBase):
-    """
-        AdaMatch algorithm (https://arxiv.org/abs/2106.04732).
-
-        Args:
-            - args (`argparse`):
-                algorithm arguments
-            - net_builder (`callable`):
-                network loading function
-            - tb_log (`TBLog`):
-                tensorboard logger
-            - logger (`logging.Logger`):
-                logger to use
-            - T (`float`):
-                Temperature for pseudo-label sharpening
-            - p_cutoff(`float`):
-                Confidence threshold for generating pseudo-labels
-            - hard_label (`bool`, *optional*, default to `False`):
-                If True, targets have [Batch size] shape with int values. If False, the target is vector
-            - ema_p (`float`):
-                momentum for average probability
-    """
+@ALGORITHMS.register('instant')
+class InstanT(AlgorithmBase):
     def __init__(self, args, net_builder, tb_log=None, logger=None):
         super().__init__(args, net_builder, tb_log, logger) 
         self.init(p_cutoff=args.p_cutoff, T=args.T, hard_label=args.hard_label, ema_p=args.ema_p)
-        self.instant_start = 0
-        if self.dataset == 'cifar10' or self.dataset == 'cifar100':
-            self.estimator = ResNet34(self.num_classes*self.num_classes).cuda(self.args.gpu)
-        elif self.dataset == 'stl10':
-            self.estimator = ResNet34(self.num_classes*self.num_classes).cuda(self.args.gpu)
-        self.T_optimizer = torch.optim.SGD(self.estimator.parameters(), lr=0.001, weight_decay=5e-4)
-        
+        self.warm_up_it = args.warm_up_it
+        self.total_logit_confusion = torch.zeros((self.num_classes,self.num_classes))
+        self.total_logit_count = torch.zeros(self.num_classes)
+        self.estimation = args.estimation
+        self.scale = args.scale
+        if self.estimation == "instance":
+            self.T_estimator = ResNet18(self.num_classes*self.num_classes,scale=self.scale).cuda(self.args.gpu)
+            self.T_optimizer = torch.optim.SGD(self.T_estimator.parameters(), lr=0.001, weight_decay=5e-4, momentum=0.9)
+            self.sum = 0
+        elif self.estimation == "class":
+            self.vol_T = scale_t(self.gpu, self.num_classes, scale=self.scale)
+            self.optimizer_vol_T = torch.optim.SGD(self.vol_T.parameters(), lr=0.01, weight_decay=0, momentum=0.9)
+        else:
+            raise Exception("Unsupported estimator.")
+        # for evaluate T
+        self.confmat = torch.zeros((self.num_classes, self.num_classes))
+        self.num_calls = 0
+        # end
     def init(self, p_cutoff, T, hard_label=True, ema_p=0.999):
         self.p_cutoff = p_cutoff
         self.T = T
@@ -58,12 +53,11 @@ class AdaMatch(AlgorithmBase):
         self.register_hook(
             DistAlignEMAHook(num_classes=self.num_classes, momentum=self.args.ema_p, p_target_type='model'), 
             "DistAlignHook")
-        self.register_hook(AdaMatchThresholdingHook(), "MaskingHook")
-        # self.register_hook(InstantThresholdingHook(), "MaskingHook")
+        self.register_hook(gt_InstantThresholdingHook(num_classes=self.num_classes), "MaskingHook")
         super().set_hooks()
 
 
-    def train_step(self, x_lb, y_lb, x_ulb_w, x_ulb_s):
+    def train_step(self, x_lb, y_lb, idx_ulb, x_ulb_w, x_ulb_s):
         num_lb = y_lb.shape[0]
 
         # inference and calculate sup/unsup losses
@@ -87,12 +81,11 @@ class AdaMatch(AlgorithmBase):
                     logits_x_ulb_w = outs_x_ulb_w['logits']
                     feats_x_ulb_w = outs_x_ulb_w['feat']
             feat_dict = {'x_lb':feats_x_lb, 'x_ulb_w':feats_x_ulb_w, 'x_ulb_s':feats_x_ulb_s}
-                    
+            
 
             sup_loss = self.ce_loss(logits_x_lb, y_lb, reduction='mean')
-
-            # probs_x_lb = torch.softmax(logits_x_lb.detach(), dim=-1)
-            # probs_x_ulb_w = torch.softmax(logits_x_ulb_w.detach(), dim=-1)
+            # y_ulb = self.dataset_dict['train_ulb'].__sample__(idx_ulb.cpu())[-1]
+            
             probs_x_lb = self.compute_prob(logits_x_lb.detach())
             probs_x_ulb_w = self.compute_prob(logits_x_ulb_w.detach())
 
@@ -101,27 +94,46 @@ class AdaMatch(AlgorithmBase):
 
             # calculate weight
             mask = self.call_hook("masking", "MaskingHook", logits_x_lb=probs_x_lb, logits_x_ulb=probs_x_ulb_w, x_ulb_w=x_ulb_w, softmax_x_lb=False, softmax_x_ulb=False)
-
             # generate unlabeled targets using pseudo label hook
             pseudo_label = self.call_hook("gen_ulb_targets", "PseudoLabelingHook", 
                                           logits=probs_x_ulb_w,
                                           use_hard_label=self.use_hard_label,
                                           T=self.T,
                                           softmax=False)
+            bool_mask = torch.gt(mask, 0)
 
+            # if self.it % self.num_eval_iter == 0:
+            #     if self.estimation == "instance":
+            #         print(self.T_estimator(x_ulb_w).mean(dim=0))
+            #     else:
+            #         print(self.vol_T())
             # calculate loss
-            unsup_loss = self.consistency_loss(logits_x_ulb_s,
+            if self.it < self.warm_up_it:
+                unsup_loss = self.consistency_loss(logits_x_ulb_s,
                                                pseudo_label,
                                                'ce',
                                                mask=mask)
-
+            # forward correction starts
+            else:
+                # instance-dependent case
+                if self.estimation == "instance":
+                    unsup_loss = forward_loss(logits_x_ulb_s, pseudo_label, self.T_estimator(x_ulb_w), mask=mask)
+                else:
+                    t = self.vol_T()
+                    unsup_loss = class_forward_loss(logits_x_ulb_s, pseudo_label, t, mask=mask)
+                
             total_loss = sup_loss + self.lambda_u * unsup_loss
-
-        out_dict = self.process_out_dict(loss=total_loss, feat=feat_dict)
+        
+        out_dict = self.process_out_dict(loss=total_loss, xu_loss=unsup_loss, feat=feat_dict)
         log_dict = self.process_log_dict(sup_loss=sup_loss.item(), 
                                          unsup_loss=unsup_loss.item(), 
                                          total_loss=total_loss.item(), 
                                          util_ratio=mask.float().mean().item())
+        self.out_dict = out_dict
+        if self.estimation == "instance":
+            self.InstanT_update()
+        else:
+            self.T_update()
         return out_dict, log_dict
 
 
@@ -140,7 +152,23 @@ class AdaMatch(AlgorithmBase):
         self.print_fn("additional parameter loaded")
         return checkpoint
         
-        
+    def eval_T(self, true, pred):
+        return torch.abs(true - pred).mean()
+
+    def estimate_ncp(self, x_lb, y_lb):
+        out = self.model(x_lb)
+        ncp = F.softmax(out['logits'],dim=-1)
+        return ncp, ncp.size()[0]
+    def T_update(self):
+        self.optimizer_vol_T.zero_grad()
+        unsup_loss = self.out_dict['xu_loss']
+        unsup_loss.backward(retain_graph=True)
+        self.optimizer_vol_T.step()
+    def InstanT_update(self):
+        self.T_optimizer.zero_grad()
+        unsup_loss = self.out_dict['xu_loss']
+        unsup_loss.backward(retain_graph=True)
+        self.T_optimizer.step()
 
     @staticmethod
     def get_argument():

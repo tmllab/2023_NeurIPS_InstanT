@@ -85,11 +85,7 @@ class BasicDataset(Dataset):
                 img = Image.fromarray(img)
             img_w = self.transform(img)
             if not self.is_ulb:
-                if self.alg == 'defixmatch' and self.strong_transform is not None:
-                    # NOTE Strong augmentation on the labelled for DeFixMatch
-                    return {'idx_lb': idx, 'x_lb': img_w, 'x_lb_s': self.strong_transform(img), 'y_lb': target} 
-                else:
-                    return {'idx_lb': idx, 'x_lb': img_w, 'y_lb': target}
+                return {'idx_lb': idx, 'x_lb': img_w, 'y_lb': target} 
             else:
                 if self.alg == 'fullysupervised' or self.alg == 'supervised':
                     return {'idx_ulb': idx}
@@ -108,7 +104,7 @@ class BasicDataset(Dataset):
                 elif self.alg == 'comatch':
                     return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s_0': self.strong_transform(img), 'x_ulb_s_1':self.strong_transform(img)} 
                 else:
-                    return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s': self.strong_transform(img)} 
+                    return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s': self.strong_transform(img), 'y_ulb': target} 
 
 
     def __len__(self):
